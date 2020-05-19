@@ -11,6 +11,9 @@ from afy.videocaptureasync import VideoCaptureAsync
 from afy.arguments import opt
 from afy.utils import Once, log, crop, pad_img, resize, TicToc
 
+import threading
+from predictor_worker import ThreadedBase, MessageBuffer
+
 
 from sys import platform as _platform
 _streaming = False
@@ -24,6 +27,89 @@ if _platform == 'darwin':
         log('\nOnly remote GPU mode is supported for Mac (use --worker-host option to connect to the server)')
         log('Standalone version will be available lately!\n')
         exit()
+
+
+class FramePredictBuffer(object):
+    BACKPRESSURE_THRESHOLD_FRAMES = 8 * 1
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._drain_event = threading.Event()
+        self._frame_buffer = MessageBuffer(self._on_frame_buffer_updated, self._lock, name="Frame")
+        self._predict_buffer = MessageBuffer(self._on_predict_buffer_updated, self._lock, name="Predict")
+        self._update_event()
+
+        self._frame_drain_count = 0
+        self._drain_event.set()
+
+    @property
+    def frame_buffer(self):
+        return self._frame_buffer
+
+    @property
+    def predict_buffer(self):
+        return self._predict_buffer
+
+    def add_frame(self, frame):
+        self._frame_buffer.add(frame)
+
+    def add_predict(self, predict):
+        self._predict_buffer.add(predict)
+
+    def wait_for_drain_frames(self):
+        self._drain_event.wait()
+
+    def is_draining_frames(self):
+        return self._frame_drain_count > 0
+
+    def _update_event(self):
+        # this call will be protected by a shared lock across both containers, so it's safe to check both sizes here
+        if self._frame_buffer.size > 0 and self._predict_buffer.size > 0:
+            if not self._event.is_set():
+                log("Setting event")
+                self._event.set()
+        else:
+            log("Clearing event")
+            self._event.clear()
+
+    def _on_frame_buffer_updated(self, buffer, prev_size, new_size):
+        self._update_event()
+
+        if self.is_draining_frames():
+            self._frame_drain_count = min(self._frame_drain_count - (new_size - prev_size), 0)
+            if self._frame_drain_count == 0:
+                log("Setting drain event")
+                self._drain_event.set()
+        elif (self._frame_buffer.size - self._predict_buffer.size) >= self.BACKPRESSURE_THRESHOLD_FRAMES:
+            self._frame_drain_count = self.BACKPRESSURE_THRESHOLD_FRAMES
+            log("Clearing drain event")
+            self._drain_event.clear()
+
+    def _on_predict_buffer_updated(self, buffer, prev_size, new_size):
+        self._update_event()
+
+    def get_next(self):
+        self._event.wait()
+        frame = self._frame_buffer.pop_next_non_blocking()
+        predict = self._predict_buffer.pop_next_non_blocking()
+        return frame, predict
+
+
+class RemoteFrameProcessor(ThreadedBase):
+    def __init__(self, frame_predict_buffer):
+        super().__init__("MessageProcessor")
+        self._frame_predict_buffer = frame_predict_buffer
+
+    def run(self):
+        while self._running:
+            frame, predict = self._frame_predict_buffer.get_next()
+            #frame = self._frame_buffer.pop_next()
+            #predict = self._predict_buffer.pop_next()
+            if frame is not None and predict is not None:
+                process_frame(frame, predict)
+            else:
+                log("RemoteFrameProcessor: either frame or predict are None, ignoring")
 
 
 def is_new_frame_better(source, driving, precitor):
@@ -99,6 +185,22 @@ def draw_rect(img, rw=0.6, rh=0.8, color=(255, 0, 0), thickness=2):
     img = cv2.rectangle(img, (int(l), int(u)), (int(r), int(d)), color, thickness)
 
 
+class FPS(object):
+    def __init__(self):
+        self._fps_hist = []
+        self._fps = 0
+
+    def update(self, time):
+        self._fps_hist.append(time)
+        if len(self._fps_hist) == 10:
+            self._fps = 10 / (sum(self._fps_hist) / 1000)
+            self._fps_hist = []
+
+    @property
+    def value(self):
+        return self._fps
+
+
 def print_help():
     log('\n\n=== Control keys ===')
     log('1-9: Change avatar')
@@ -124,6 +226,9 @@ if __name__ == "__main__":
         log('Force no streaming')
         _streaming = False
 
+    is_remote = False
+    frame_buffer = None
+
     log('Loading Predictor')
     predictor_args = {
         'config_path': opt.config,
@@ -139,8 +244,13 @@ if __name__ == "__main__":
     elif opt.worker_host:
         from afy import predictor_remote
         try:
+            is_remote = True
+            frame_predict_buffer = FramePredictBuffer()
+            frame_buffer = frame_predict_buffer.frame_buffer
+            remote_frame_processor = RemoteFrameProcessor(frame_predict_buffer)
+            remote_frame_processor.start()
             predictor = predictor_remote.PredictorRemote(
-                worker_host=opt.worker_host, worker_port=opt.worker_port,
+                worker_host=opt.worker_host, worker_port=opt.worker_port, predict_buffer=frame_predict_buffer.predict_buffer,
                 **predictor_args
             )
         except ConnectionError as err:
@@ -181,14 +291,72 @@ if __name__ == "__main__":
     find_keyframe = False
     is_calibrated = False
 
-    fps_hist = []
-    fps = 0
+    fps = FPS()
     show_fps = False
 
     print_help()
 
+    def wait_for_drain_frames():
+        frame_predict_buffer.wait_for_drain_frames()
+
+    def process_frame(frame, out):
+        log("processing frame")
+        if _streaming:
+            out = resize(out, stream_img_size)
+            stream.schedule_frame(out)
+
+        if overlay_alpha > 0:
+            preview_frame = cv2.addWeighted(avatars[cur_ava], overlay_alpha, frame, 1.0 - overlay_alpha, 0.0)
+        else:
+            preview_frame = frame.copy()
+
+        if preview_flip:
+            preview_frame = cv2.flip(preview_frame, 1)
+
+        if output_flip:
+            out = cv2.flip(out, 1)
+
+        if green_overlay:
+            green_alpha = 0.8
+            overlay = preview_frame.copy()
+            overlay[:] = (0, 255, 0)
+            preview_frame = cv2.addWeighted(preview_frame, green_alpha, overlay, 1.0 - green_alpha, 0.0)
+
+        timing['postproc'] = tt.toc()
+
+        if find_keyframe:
+            preview_frame = cv2.putText(preview_frame, display_string, (10, 220), 0, 0.5 * IMG_SIZE / 256,
+                                        (255, 255, 255), 1)
+
+        if show_fps:
+            timing_string = f"FPS/Model/Pre/Post: {fps.value:.1f} / {timing['predict']:.1f} / {timing['preproc']:.1f} / {timing['postproc']:.1f}"
+            preview_frame = cv2.putText(preview_frame, timing_string, (10, 240), 0, 0.3 * IMG_SIZE / 256,
+                                        (255, 255, 255), 1)
+
+        if not is_calibrated:
+            color = (0, 0, 255)
+            thk = 2
+            fontsz = 0.5
+            preview_frame = cv2.putText(preview_frame, "FIT FACE IN RECTANGLE", (40, 20), 0, fontsz * IMG_SIZE / 255,
+                                        color, thk)
+            preview_frame = cv2.putText(preview_frame, "W - ZOOM IN", (60, 40), 0, fontsz * IMG_SIZE / 255, color, thk)
+            preview_frame = cv2.putText(preview_frame, "S - ZOOM OUT", (60, 60), 0, fontsz * IMG_SIZE / 255, color, thk)
+            preview_frame = cv2.putText(preview_frame, "THEN PRESS X", (60, 245), 0, fontsz * IMG_SIZE / 255, color,
+                                        thk)
+
+        if not opt.hide_rect:
+            draw_rect(preview_frame)
+
+        cv2.imshow('cam', preview_frame[..., ::-1])
+        if is_calibrated:
+            cv2.imshow('avatarify', out[..., ::-1])
+
+        fps.update(tt.toc(total=True))
+        log("finished frame")
+
     try:
         while True:
+            log("Begin while true")
             tt = TicToc()
 
             timing = {
@@ -201,7 +369,9 @@ if __name__ == "__main__":
 
             tt.tic()
 
+            log("Going to read camera")
             ret, frame = cap.read()
+            log("After read camera")
             if not ret:
                 log("Can't receive frame (stream end?). Exiting ...")
                 break
@@ -221,8 +391,15 @@ if __name__ == "__main__":
 
             timing['preproc'] = tt.toc()
 
+            out = None
             if passthrough:
                 out = frame
+            elif is_remote:
+                frame_buffer.add(frame)
+                predictor.predict_async(frame)
+                log("waiting for drain")
+                wait_for_drain_frames()
+                log("after wait for drain")
             else:
                 tt.tic()
                 pred = predictor.predict(frame)
@@ -233,7 +410,7 @@ if __name__ == "__main__":
 
             if not opt.no_pad:
                 out = pad_img(out, stream_img_size)
-            
+
             key = cv2.waitKey(1)
 
             if key == 27: # ESC
@@ -290,7 +467,7 @@ if __name__ == "__main__":
                 if not is_calibrated:
                     cv2.namedWindow('avatarify', cv2.WINDOW_GUI_NORMAL)
                     cv2.moveWindow('avatarify', 600, 250)
-                
+
                 is_calibrated = True
             elif key == ord('z'):
                 overlay_alpha = max(overlay_alpha - 0.1, 0.0)
@@ -329,56 +506,9 @@ if __name__ == "__main__":
             elif key != -1:
                 log(key)
 
-            if _streaming:
-                out = resize(out, stream_img_size)
-                stream.schedule_frame(out)
+            if not is_remote:
+                process_frame(frame, out)
 
-            if overlay_alpha > 0:
-                preview_frame = cv2.addWeighted( avatars[cur_ava], overlay_alpha, frame, 1.0 - overlay_alpha, 0.0)
-            else:
-                preview_frame = frame.copy()
-            
-            if preview_flip:
-                preview_frame = cv2.flip(preview_frame, 1)
-                
-            if output_flip:
-                out = cv2.flip(out, 1)
-                
-            if green_overlay:
-                green_alpha = 0.8
-                overlay = preview_frame.copy()
-                overlay[:] = (0, 255, 0)
-                preview_frame = cv2.addWeighted( preview_frame, green_alpha, overlay, 1.0 - green_alpha, 0.0)
-
-            timing['postproc'] = tt.toc()
-                
-            if find_keyframe:
-                preview_frame = cv2.putText(preview_frame, display_string, (10, 220), 0, 0.5 * IMG_SIZE / 256, (255, 255, 255), 1)
-
-            if show_fps:
-                timing_string = f"FPS/Model/Pre/Post: {fps:.1f} / {timing['predict']:.1f} / {timing['preproc']:.1f} / {timing['postproc']:.1f}"
-                preview_frame = cv2.putText(preview_frame, timing_string, (10, 240), 0, 0.3 * IMG_SIZE / 256, (255, 255, 255), 1)
-
-            if not is_calibrated:
-                color = (0, 0, 255)
-                thk = 2
-                fontsz = 0.5
-                preview_frame = cv2.putText(preview_frame, "FIT FACE IN RECTANGLE", (40, 20), 0, fontsz * IMG_SIZE / 255, color, thk)
-                preview_frame = cv2.putText(preview_frame, "W - ZOOM IN", (60, 40), 0, fontsz * IMG_SIZE / 255, color, thk)
-                preview_frame = cv2.putText(preview_frame, "S - ZOOM OUT", (60, 60), 0, fontsz * IMG_SIZE / 255, color, thk)
-                preview_frame = cv2.putText(preview_frame, "THEN PRESS X", (60, 245), 0, fontsz * IMG_SIZE / 255, color, thk)
-
-            if not opt.hide_rect:
-                draw_rect(preview_frame)
-
-            cv2.imshow('cam', preview_frame[..., ::-1])
-            if is_calibrated:
-                cv2.imshow('avatarify', out[..., ::-1])
-
-            fps_hist.append(tt.toc(total=True))
-            if len(fps_hist) == 10:
-                fps = 10 / (sum(fps_hist) / 1000)
-                fps_hist = []
     except KeyboardInterrupt:
         pass
 
