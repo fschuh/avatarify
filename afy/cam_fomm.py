@@ -67,10 +67,8 @@ class FramePredictBuffer(object):
         # this call will be protected by a shared lock across both containers, so it's safe to check both sizes here
         if self._frame_buffer.size > 0 and self._predict_buffer.size > 0:
             if not self._event.is_set():
-                log("Setting event")
                 self._event.set()
         else:
-            log("Clearing event")
             self._event.clear()
 
     def _on_frame_buffer_updated(self, buffer, prev_size, new_size):
@@ -79,11 +77,9 @@ class FramePredictBuffer(object):
         if self.is_draining_frames():
             self._frame_drain_count = min(self._frame_drain_count - (new_size - prev_size), 0)
             if self._frame_drain_count == 0:
-                log("Setting drain event")
                 self._drain_event.set()
         elif (self._frame_buffer.size - self._predict_buffer.size) >= self.BACKPRESSURE_THRESHOLD_FRAMES:
             self._frame_drain_count = self.BACKPRESSURE_THRESHOLD_FRAMES
-            log("Clearing drain event")
             self._drain_event.clear()
 
     def _on_predict_buffer_updated(self, buffer, prev_size, new_size):
@@ -300,7 +296,6 @@ if __name__ == "__main__":
         frame_predict_buffer.wait_for_drain_frames()
 
     def process_frame(frame, out):
-        log("processing frame")
         if _streaming:
             out = resize(out, stream_img_size)
             stream.schedule_frame(out)
@@ -352,11 +347,9 @@ if __name__ == "__main__":
             cv2.imshow('avatarify', out[..., ::-1])
 
         fps.update(tt.toc(total=True))
-        log("finished frame")
 
     try:
         while True:
-            log("Begin while true")
             tt = TicToc()
 
             timing = {
@@ -369,9 +362,7 @@ if __name__ == "__main__":
 
             tt.tic()
 
-            log("Going to read camera")
             ret, frame = cap.read()
-            log("After read camera")
             if not ret:
                 log("Can't receive frame (stream end?). Exiting ...")
                 break
@@ -397,9 +388,7 @@ if __name__ == "__main__":
             elif is_remote:
                 frame_buffer.add(frame)
                 predictor.predict_async(frame)
-                log("waiting for drain")
                 wait_for_drain_frames()
-                log("after wait for drain")
             else:
                 tt.tic()
                 pred = predictor.predict(frame)

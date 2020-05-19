@@ -13,7 +13,7 @@ m.patch()
 
 
 def create_message(attr, data):
-    log("Creating message for sending: {}".format(attr))
+    # log("Creating message for sending: {}".format(attr))
     return {
         "attr": attr,
         "data": data
@@ -34,7 +34,7 @@ class MessageBuffer(object):
         self._event = threading.Event()
         self._on_update_callback = on_update_callback
         self._name = name
-        self._debug = True
+        self._debug = False
 
     @property
     def size(self):

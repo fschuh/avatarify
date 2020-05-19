@@ -118,9 +118,7 @@ class PredictorRemote:
 
         tt.tic()
         #attr_recv, data_recv = self.socket.recv_data()
-        log("going to fetch next message")
         message = self.message_buffer.pop_next()
-        log("after fetch next message")
         attr_recv = message["attr"]
         data_recv = message["data"]
         self.timing.add('RECV', tt.toc())
