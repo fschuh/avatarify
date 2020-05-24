@@ -30,7 +30,7 @@ if _platform == 'darwin':
 
 
 class FramePredictBuffer(object):
-    BACKPRESSURE_THRESHOLD_FRAMES = 8 * 1
+    BACKPRESSURE_THRESHOLD_FRAMES = 8 * 1  # DEADLOCK happening with 6 frame, investigate!
 
     def __init__(self):
         self._lock = threading.Lock()

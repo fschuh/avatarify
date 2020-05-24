@@ -13,7 +13,7 @@ m.patch()
 
 
 def create_message(attr, data):
-    # log("Creating message for sending: {}".format(attr))
+    log("Creating message for sending: {}".format(attr))
     return {
         "attr": attr,
         "data": data
@@ -34,7 +34,7 @@ class MessageBuffer(object):
         self._event = threading.Event()
         self._on_update_callback = on_update_callback
         self._name = name
-        self._debug = False
+        self._debug = True
 
     @property
     def size(self):
@@ -60,12 +60,12 @@ class MessageBuffer(object):
     
     def pop_next(self):
         self._event.wait()
-        return self._pop()
+        return self._pop_next()
 
     def pop_next_non_blocking(self):
-        return self._pop()
+        return self._pop_next()
 
-    def _pop(self):
+    def _pop_next(self):
         with self._lock:
             if len(self._buf) == 0:
                 return None
